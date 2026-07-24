@@ -11,6 +11,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from charset_normalizer import from_bytes
 
 
 CONTACT_WORDS = (
@@ -49,6 +50,21 @@ EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", re.IGNORECASE)
 PHONE_RE = re.compile(
     r"(?:\+?\d[\s().-]*){10,18}"
 )
+BAD_EMAIL_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".js",
+    ".css",
+    ".map",
+    ".woff",
+    ".woff2",
+    ".ttf",
+)
+PACKAGE_VERSION_RE = re.compile(r"@\d+(?:\.\d+){1,3}$")
 
 
 @dataclass
@@ -102,12 +118,51 @@ def fetch(session: requests.Session, url: str, timeout: int) -> requests.Respons
     return response
 
 
+def response_text(response: requests.Response) -> str:
+    detected = from_bytes(response.content).best()
+    if detected:
+        return str(detected)
+    return response.text
+
+
+def clean_email(value: str) -> str:
+    email = value.strip(" .,:;()[]{}<>\"'").lower()
+    if not email or PACKAGE_VERSION_RE.search(email):
+        return ""
+    if email.endswith(BAD_EMAIL_EXTENSIONS):
+        return ""
+
+    local_part, _, domain = email.partition("@")
+    if not local_part or not domain or "." not in domain:
+        return ""
+    if any(domain.endswith(ext) for ext in BAD_EMAIL_EXTENSIONS):
+        return ""
+
+    return email
+
+
+def extract_emails(value: str) -> set[str]:
+    emails: set[str] = set()
+    for match in EMAIL_RE.findall(value):
+        email = clean_email(match)
+        if email:
+            emails.add(email)
+    return emails
+
+
 def clean_phone(value: str) -> str:
     value = re.sub(r"\s+", " ", value).strip(" .,-;:()")
     digits = re.sub(r"\D", "", value)
-    if len(digits) < 10 or len(digits) > 15:
+
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    elif len(digits) == 10:
+        digits = "7" + digits
+
+    if not (len(digits) == 11 and digits.startswith("7")):
         return ""
-    return value
+
+    return f"+{digits}"
 
 
 def same_domain(url: str, candidate: str) -> bool:
@@ -137,7 +192,7 @@ def extract_from_html(result: ScrapeResult, html: str, page_url: str) -> list[st
     if not result.company_name:
         result.company_name = extract_company_name(soup)
 
-    result.emails.update(email.lower() for email in EMAIL_RE.findall(html + " " + text))
+    result.emails.update(extract_emails(html + " " + text))
 
     for match in PHONE_RE.findall(text):
         phone = clean_phone(match)
@@ -155,7 +210,7 @@ def extract_from_html(result: ScrapeResult, html: str, page_url: str) -> list[st
             result.social_links.add(absolute.split("#")[0])
 
         if href_lower.startswith("mailto:"):
-            result.emails.update(email.lower() for email in EMAIL_RE.findall(href))
+            result.emails.update(extract_emails(href))
 
         if href_lower.startswith("tel:"):
             phone = clean_phone(href[4:])
@@ -178,7 +233,7 @@ def scrape_site(url: str, timeout: int, max_pages: int) -> ScrapeResult:
     try:
         response = fetch(session, url, timeout)
         result.final_url = response.url
-        pages_to_try = extract_from_html(result, response.text, response.url)
+        pages_to_try = extract_from_html(result, response_text(response), response.url)
 
         visited = {response.url.split("#")[0]}
         for page_url in pages_to_try[:max_pages]:
@@ -187,7 +242,7 @@ def scrape_site(url: str, timeout: int, max_pages: int) -> ScrapeResult:
             visited.add(page_url)
             try:
                 page_response = fetch(session, page_url, timeout)
-                extract_from_html(result, page_response.text, page_response.url)
+                extract_from_html(result, response_text(page_response), page_response.url)
             except requests.RequestException:
                 continue
     except requests.RequestException as exc:
